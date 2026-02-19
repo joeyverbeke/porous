@@ -20,7 +20,7 @@ static const size_t MIC_FRAME_WINDOW = 1024;   // ~21.3 ms at 48 kHz
 // SPL estimation + triggering
 static const float SPL_OFFSET_DB = 120.0f;
 static const float SPL_CALIBRATION_DB = 0.0f;
-static const float ROLLING_AVG_MS = 1200.0f;
+static const float ROLLING_AVG_MS = 750.0f;
 static const float THRESHOLD_DB_SPL = 60.0f;
 static const float HYSTERESIS_DB = 3.0f;
 static const float PLAYBACK_GAIN = 0.5f;     // 0.0 = mute, 1.0 = original level
