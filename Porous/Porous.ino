@@ -1,7 +1,13 @@
 #include <Arduino.h>
+#include <BLE2902.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
 #include <driver/gpio.h>
 #include <driver/i2s.h>
 #include <math.h>
+#include <memory>
+#include <stdarg.h>
 #include <stdint.h>
 #include <Preferences.h>
 #include "audio_data.h"
@@ -40,6 +46,14 @@ static const bool DEFAULT_DEBUG_ENABLED = true;
 static const uint32_t TELEMETRY_INTERVAL_MS = 1000;
 static const float FADE_IN_MS = 220.0f;
 static const float FADE_OUT_MS = 220.0f;
+static const char* BLE_DEVICE_NAME = "Porous";
+static const char* BLE_SERVICE_UUID = "64dbf000-3c92-4ca7-b9f0-d5f4d7f25b10";
+static const char* BLE_TX_CHARACTERISTIC_UUID = "64dbf001-3c92-4ca7-b9f0-d5f4d7f25b10";
+static const char* BLE_RX_CHARACTERISTIC_UUID = "64dbf002-3c92-4ca7-b9f0-d5f4d7f25b10";
+static const size_t BLE_TX_CHUNK_SIZE = 20;
+static const size_t BLE_RX_BUFFER_SIZE = 512;
+static const size_t BLE_TX_BUFFER_SIZE = 2048;
+static const uint32_t BLE_TX_CHUNK_INTERVAL_MS = 15;
 
 // Audio header is 16-bit mono @ 16 kHz.
 // This sketch runs I2S at 48 kHz, so we upsample by repeating each sample 3x.
@@ -49,6 +63,43 @@ static const uint32_t UPSAMPLE_FACTOR = SAMPLE_RATE / AUDIO_SOURCE_RATE;
 static_assert(SAMPLE_RATE % AUDIO_SOURCE_RATE == 0, "SAMPLE_RATE must be multiple of source rate");
 
 static Preferences prefs;
+
+void bleNotifyBytes(const uint8_t* data, size_t len);
+void handleCommand(const String& cmd_raw);
+
+class DualConsole : public Print {
+ public:
+  size_t write(uint8_t b) override {
+    return write(&b, 1);
+  }
+
+  size_t write(const uint8_t* buffer, size_t size) override {
+    Serial.write(buffer, size);
+    bleNotifyBytes(buffer, size);
+    return size;
+  }
+
+  int printf(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    va_list args_copy;
+    va_copy(args_copy, args);
+    int needed = vsnprintf(nullptr, 0, format, args_copy);
+    va_end(args_copy);
+    if (needed <= 0) {
+      va_end(args);
+      return needed;
+    }
+
+    std::unique_ptr<char[]> buffer(new char[static_cast<size_t>(needed) + 1]);
+    vsnprintf(buffer.get(), static_cast<size_t>(needed) + 1, format, args);
+    va_end(args);
+    write(reinterpret_cast<const uint8_t*>(buffer.get()), static_cast<size_t>(needed));
+    return needed;
+  }
+};
+
+static DualConsole Console;
 
 struct ChannelStats {
   float rms_l;
@@ -72,6 +123,21 @@ static float playback_gain_effective = DEFAULT_BASE_GAIN;
 static float playback_envelope = 0.0f;
 static bool amp_enabled = false;
 static String serial_line;
+static String ble_line;
+static BLEServer* ble_server = nullptr;
+static BLECharacteristic* ble_tx_characteristic = nullptr;
+static volatile bool ble_client_connected = false;
+static bool ble_client_connected_prev = false;
+static volatile uint32_t ble_notifications_ready_ms = 0;
+static volatile size_t ble_rx_head = 0;
+static volatile size_t ble_rx_tail = 0;
+static char ble_rx_buffer[BLE_RX_BUFFER_SIZE];
+static portMUX_TYPE ble_rx_mux = portMUX_INITIALIZER_UNLOCKED;
+static volatile size_t ble_tx_head = 0;
+static volatile size_t ble_tx_tail = 0;
+static char ble_tx_buffer[BLE_TX_BUFFER_SIZE];
+static portMUX_TYPE ble_tx_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint32_t ble_last_tx_ms = 0;
 
 // Runtime-configurable parameters
 static float rolling_avg_ms_fast = DEFAULT_ROLLING_AVG_MS_FAST;
@@ -120,6 +186,156 @@ static inline int32_t unpackRightJustified24(int32_t raw32) {
   uint32_t v = static_cast<uint32_t>(raw32) & 0x00FFFFFF;
   if (v & 0x00800000) v |= 0xFF000000;
   return static_cast<int32_t>(v);
+}
+
+bool bleQueueByte(char c) {
+  bool queued = false;
+  portENTER_CRITICAL(&ble_rx_mux);
+  size_t next = (ble_rx_head + 1) % BLE_RX_BUFFER_SIZE;
+  if (next != ble_rx_tail) {
+    ble_rx_buffer[ble_rx_head] = c;
+    ble_rx_head = next;
+    queued = true;
+  }
+  portEXIT_CRITICAL(&ble_rx_mux);
+  return queued;
+}
+
+bool blePopByte(char* c) {
+  bool has_data = false;
+  portENTER_CRITICAL(&ble_rx_mux);
+  if (ble_rx_tail != ble_rx_head) {
+    *c = ble_rx_buffer[ble_rx_tail];
+    ble_rx_tail = (ble_rx_tail + 1) % BLE_RX_BUFFER_SIZE;
+    has_data = true;
+  }
+  portEXIT_CRITICAL(&ble_rx_mux);
+  return has_data;
+}
+
+size_t bleQueueBytesForTx(const uint8_t* data, size_t len) {
+  if (data == nullptr || len == 0) return 0;
+
+  size_t written = 0;
+  portENTER_CRITICAL(&ble_tx_mux);
+  while (written < len) {
+    size_t next = (ble_tx_head + 1) % BLE_TX_BUFFER_SIZE;
+    if (next == ble_tx_tail) break;
+    ble_tx_buffer[ble_tx_head] = static_cast<char>(data[written]);
+    ble_tx_head = next;
+    written++;
+  }
+  portEXIT_CRITICAL(&ble_tx_mux);
+  return written;
+}
+
+size_t blePopTxChunk(uint8_t* out, size_t max_len) {
+  if (out == nullptr || max_len == 0) return 0;
+
+  size_t count = 0;
+  portENTER_CRITICAL(&ble_tx_mux);
+  while (count < max_len && ble_tx_tail != ble_tx_head) {
+    out[count] = static_cast<uint8_t>(ble_tx_buffer[ble_tx_tail]);
+    ble_tx_tail = (ble_tx_tail + 1) % BLE_TX_BUFFER_SIZE;
+    count++;
+  }
+  portEXIT_CRITICAL(&ble_tx_mux);
+  return count;
+}
+
+void bleClearTxQueue() {
+  portENTER_CRITICAL(&ble_tx_mux);
+  ble_tx_head = 0;
+  ble_tx_tail = 0;
+  portEXIT_CRITICAL(&ble_tx_mux);
+}
+
+class PorousBleServerCallbacks : public BLEServerCallbacks {
+ public:
+  void onConnect(BLEServer* server) override {
+    (void)server;
+    ble_client_connected = true;
+    ble_notifications_ready_ms = millis() + 1500;
+    Serial.println("BLE client connected");
+  }
+
+  void onDisconnect(BLEServer* server) override {
+    (void)server;
+    ble_client_connected = false;
+    ble_notifications_ready_ms = 0;
+    bleClearTxQueue();
+    Serial.println("BLE client disconnected");
+  }
+};
+
+class PorousBleRxCallbacks : public BLECharacteristicCallbacks {
+ public:
+  void onWrite(BLECharacteristic* characteristic) override {
+    String value = characteristic->getValue();
+    for (size_t i = 0; i < value.length(); ++i) {
+      bleQueueByte(value[i]);
+    }
+  }
+};
+
+void bleNotifyBytes(const uint8_t* data, size_t len) {
+  if (!ble_client_connected || ble_tx_characteristic == nullptr || data == nullptr || len == 0) return;
+  bleQueueBytesForTx(data, len);
+}
+
+void serviceBleTx() {
+  if (!ble_client_connected || ble_tx_characteristic == nullptr) return;
+  uint32_t now = millis();
+  if (now < ble_notifications_ready_ms) return;
+  if ((now - ble_last_tx_ms) < BLE_TX_CHUNK_INTERVAL_MS) return;
+
+  uint8_t chunk[BLE_TX_CHUNK_SIZE];
+  size_t len = blePopTxChunk(chunk, sizeof(chunk));
+  if (len == 0) return;
+
+  ble_tx_characteristic->setValue(chunk, len);
+  ble_tx_characteristic->notify();
+  ble_last_tx_ms = now;
+}
+
+void setupBLE() {
+  BLEDevice::init(BLE_DEVICE_NAME);
+  ble_server = BLEDevice::createServer();
+  ble_server->setCallbacks(new PorousBleServerCallbacks());
+
+  BLEService* service = ble_server->createService(BLE_SERVICE_UUID);
+  ble_tx_characteristic = service->createCharacteristic(
+      BLE_TX_CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY);
+  ble_tx_characteristic->addDescriptor(new BLE2902());
+
+  BLECharacteristic* ble_rx_characteristic = service->createCharacteristic(
+      BLE_RX_CHARACTERISTIC_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR);
+  ble_rx_characteristic->setCallbacks(new PorousBleRxCallbacks());
+
+  service->start();
+  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  advertising->addServiceUUID(BLE_SERVICE_UUID);
+  advertising->setScanResponse(true);
+  advertising->setMinPreferred(0x06);
+  advertising->setMinPreferred(0x12);
+  BLEDevice::startAdvertising();
+  Serial.println("BLE advertising started");
+}
+
+void processInputChar(char c, String& line) {
+  if (c == '\r') return;
+  if (c == '\n') {
+    if (line.length() > 0) {
+      handleCommand(line);
+    }
+    line = "";
+    return;
+  }
+
+  line += c;
+  if (line.length() > 160) line = "";
 }
 
 UnpackDetect detectUnpackMode(const int32_t* slots, size_t frame_count) {
@@ -198,27 +414,27 @@ void applyConfigBounds() {
 }
 
 void printConfig() {
-  Serial.println("CONFIG:");
-  Serial.printf("  debug=%d\n", debug_enabled ? 1 : 0);
-  Serial.printf("  target_mask_db=%.2f\n", target_mask_db);
-  Serial.printf("  threshold_db_spl=%.2f\n", threshold_db_spl);
-  Serial.printf("  hysteresis_db=%.2f\n", hysteresis_db);
-  Serial.printf("  rolling_avg_ms_fast=%.1f\n", rolling_avg_ms_fast);
-  Serial.printf("  rolling_avg_ms_slow=%.1f\n", rolling_avg_ms_slow);
-  Serial.printf("  gain=%.4f\n", base_playback_gain);
-  Serial.printf("  auto_gain=%d\n", auto_gain_enabled ? 1 : 0);
-  Serial.printf("  gain_trim_db=%.2f\n", gain_trim_db);
-  Serial.printf("  gain_effective=%.4f\n", playback_gain_effective);
-  Serial.printf("  gain_min=%.4f\n", playback_gain_min);
-  Serial.printf("  gain_max=%.4f\n", playback_gain_max);
-  Serial.printf("  gain_step_db_per_sec=%.2f\n", gain_step_db_per_sec);
-  Serial.printf("  gain_trim_db_limit=%.2f\n", gain_trim_db_limit);
-  Serial.printf("  min_on_ms=%lu\n", static_cast<unsigned long>(min_on_ms));
-  Serial.printf("  min_off_ms=%lu\n", static_cast<unsigned long>(min_off_ms));
-  if (has_cal_room) Serial.printf("  cal_room_db=%.2f\n", cal_room_db);
-  if (has_cal_active) Serial.printf("  cal_active_db=%.2f\n", cal_active_db);
+  Console.println("CONFIG:");
+  Console.printf("  debug=%d\n", debug_enabled ? 1 : 0);
+  Console.printf("  target_mask_db=%.2f\n", target_mask_db);
+  Console.printf("  threshold_db_spl=%.2f\n", threshold_db_spl);
+  Console.printf("  hysteresis_db=%.2f\n", hysteresis_db);
+  Console.printf("  rolling_avg_ms_fast=%.1f\n", rolling_avg_ms_fast);
+  Console.printf("  rolling_avg_ms_slow=%.1f\n", rolling_avg_ms_slow);
+  Console.printf("  gain=%.4f\n", base_playback_gain);
+  Console.printf("  auto_gain=%d\n", auto_gain_enabled ? 1 : 0);
+  Console.printf("  gain_trim_db=%.2f\n", gain_trim_db);
+  Console.printf("  gain_effective=%.4f\n", playback_gain_effective);
+  Console.printf("  gain_min=%.4f\n", playback_gain_min);
+  Console.printf("  gain_max=%.4f\n", playback_gain_max);
+  Console.printf("  gain_step_db_per_sec=%.2f\n", gain_step_db_per_sec);
+  Console.printf("  gain_trim_db_limit=%.2f\n", gain_trim_db_limit);
+  Console.printf("  min_on_ms=%lu\n", static_cast<unsigned long>(min_on_ms));
+  Console.printf("  min_off_ms=%lu\n", static_cast<unsigned long>(min_off_ms));
+  if (has_cal_room) Console.printf("  cal_room_db=%.2f\n", cal_room_db);
+  if (has_cal_active) Console.printf("  cal_active_db=%.2f\n", cal_active_db);
   if (cal_mode != CalMode::NONE) {
-    Serial.printf("  calibration=running (%s)\n", cal_mode == CalMode::ROOM ? "room" : "active");
+    Console.printf("  calibration=running (%s)\n", cal_mode == CalMode::ROOM ? "room" : "active");
   }
 }
 
@@ -295,27 +511,27 @@ void handleCommand(const String& cmd_raw) {
   if (cmd.length() == 0) return;
 
   if (cmd == "help") {
-    Serial.println("help");
-    Serial.println("show");
-    Serial.println("save");
-    Serial.println("load");
-    Serial.println("set gain 0.30");
-    Serial.println("set auto_gain 1");
-    Serial.println("set target_mask_db -8");
-    Serial.println("set threshold_db_spl 58");
-    Serial.println("set hysteresis_db 3");
-    Serial.println("set rolling_avg_ms_fast 200");
-    Serial.println("set rolling_avg_ms_slow 5000");
-    Serial.println("set gain_min 0.02");
-    Serial.println("set gain_max 1.00");
-    Serial.println("set gain_step_db_per_sec 2.0");
-    Serial.println("set gain_trim_db_limit 6.0");
-    Serial.println("set min_on_ms 3000");
-    Serial.println("set min_off_ms 3000");
-    Serial.println("set debug 1");
-    Serial.println("cal_room 20");
-    Serial.println("cal_active 20");
-    Serial.println("Note: gain is linear (0.30), not +dB.");
+    Console.println("help");
+    Console.println("show");
+    Console.println("save");
+    Console.println("load");
+    Console.println("set gain 0.30");
+    Console.println("set auto_gain 1");
+    Console.println("set target_mask_db -8");
+    Console.println("set threshold_db_spl 58");
+    Console.println("set hysteresis_db 3");
+    Console.println("set rolling_avg_ms_fast 200");
+    Console.println("set rolling_avg_ms_slow 5000");
+    Console.println("set gain_min 0.02");
+    Console.println("set gain_max 1.00");
+    Console.println("set gain_step_db_per_sec 2.0");
+    Console.println("set gain_trim_db_limit 6.0");
+    Console.println("set min_on_ms 3000");
+    Console.println("set min_off_ms 3000");
+    Console.println("set debug 1");
+    Console.println("cal_room 20");
+    Console.println("cal_active 20");
+    Console.println("Note: gain is linear (0.30), not +dB.");
     return;
   }
   if (cmd == "show") {
@@ -324,12 +540,12 @@ void handleCommand(const String& cmd_raw) {
   }
   if (cmd == "save") {
     saveConfigToNVS();
-    Serial.println("Saved config to NVS");
+    Console.println("Saved config to NVS");
     return;
   }
   if (cmd == "load") {
     loadConfigFromNVS();
-    Serial.println("Loaded config from NVS");
+    Console.println("Loaded config from NVS");
     printConfig();
     return;
   }
@@ -343,7 +559,7 @@ void handleCommand(const String& cmd_raw) {
     cal_end_ms = millis() + seconds * 1000UL;
     cal_sum_db = 0.0;
     cal_count = 0;
-    Serial.printf("Calibration started: ROOM for %lu s\n", static_cast<unsigned long>(seconds));
+    Console.printf("Calibration started: ROOM for %lu s\n", static_cast<unsigned long>(seconds));
     return;
   }
 
@@ -356,7 +572,7 @@ void handleCommand(const String& cmd_raw) {
     cal_end_ms = millis() + seconds * 1000UL;
     cal_sum_db = 0.0;
     cal_count = 0;
-    Serial.printf("Calibration started: ACTIVE for %lu s\n", static_cast<unsigned long>(seconds));
+    Console.printf("Calibration started: ACTIVE for %lu s\n", static_cast<unsigned long>(seconds));
     return;
   }
 
@@ -364,7 +580,7 @@ void handleCommand(const String& cmd_raw) {
     int sp1 = cmd.indexOf(' ');
     int sp2 = cmd.indexOf(' ', sp1 + 1);
     if (sp2 <= sp1 + 1) {
-      Serial.println("Usage: set <key> <value>");
+      Console.println("Usage: set <key> <value>");
       return;
     }
     String key = cmd.substring(sp1 + 1, sp2);
@@ -372,30 +588,29 @@ void handleCommand(const String& cmd_raw) {
     key.trim();
     value.trim();
     if (!setConfigField(key, value)) {
-      Serial.println("Unknown key");
+      Console.println("Unknown key");
       return;
     }
-    Serial.print("Set ");
-    Serial.print(key);
-    Serial.print(" = ");
-    Serial.println(value);
+    Console.print("Set ");
+    Console.print(key);
+    Console.print(" = ");
+    Console.println(value);
     return;
   }
 
-  Serial.println("Unknown command; type 'help'");
+  Console.println("Unknown command; type 'help'");
 }
 
 void processSerialCommands() {
   while (Serial.available() > 0) {
-    char c = static_cast<char>(Serial.read());
-    if (c == '\r') continue;
-    if (c == '\n') {
-      handleCommand(serial_line);
-      serial_line = "";
-    } else {
-      serial_line += c;
-      if (serial_line.length() > 160) serial_line = "";
-    }
+    processInputChar(static_cast<char>(Serial.read()), serial_line);
+  }
+}
+
+void processBleCommands() {
+  char c = 0;
+  while (blePopByte(&c)) {
+    processInputChar(c, ble_line);
   }
 }
 
@@ -462,19 +677,19 @@ void setupI2S() {
 
   esp_err_t e = i2s_driver_install(I2S_PORT, &cfg, 0, nullptr);
   if (e != ESP_OK) {
-    Serial.printf("i2s_driver_install failed: %d\n", static_cast<int>(e));
+    Console.printf("i2s_driver_install failed: %d\n", static_cast<int>(e));
     while (true) delay(1000);
   }
 
   e = i2s_set_pin(I2S_PORT, &pins);
   if (e != ESP_OK) {
-    Serial.printf("i2s_set_pin failed: %d\n", static_cast<int>(e));
+    Console.printf("i2s_set_pin failed: %d\n", static_cast<int>(e));
     while (true) delay(1000);
   }
 
   e = i2s_set_clk(I2S_PORT, SAMPLE_RATE, I2S_BITS_PER_SAMPLE_32BIT, I2S_CHANNEL_STEREO);
   if (e != ESP_OK) {
-    Serial.printf("i2s_set_clk failed: %d\n", static_cast<int>(e));
+    Console.printf("i2s_set_clk failed: %d\n", static_cast<int>(e));
     while (true) delay(1000);
   }
 
@@ -486,6 +701,7 @@ void setupI2S() {
 void setup() {
   Serial.begin(115200);
   delay(500);
+  setupBLE();
   loadConfigFromNVS();
 
   pinMode(PIN_AMP_SD, OUTPUT);
@@ -494,12 +710,12 @@ void setup() {
   setupI2S();
 
   if (debug_enabled) {
-    Serial.println("Porous started");
-    Serial.printf(
+    Console.println("Porous started");
+    Console.printf(
         "threshold=%.1f dBSPL, hysteresis=%.1f dB, mask=%.1f dB, fast=%.0f ms, slow=%.0f ms, minOn=%lu ms, minOff=%lu ms, gain=%.2f\n",
         threshold_db_spl, hysteresis_db, target_mask_db, rolling_avg_ms_fast, rolling_avg_ms_slow,
         static_cast<unsigned long>(min_on_ms), static_cast<unsigned long>(min_off_ms), base_playback_gain);
-    Serial.println("Type 'help' for runtime commands");
+    Console.println("Type 'help' for runtime commands");
   }
   last_state_change_ms = millis() - min_off_ms;
 }
@@ -509,11 +725,22 @@ void loop() {
   static int32_t tx_slots[MIC_FRAME_WINDOW * 2];
   static uint32_t last_print_ms = 0;
   processSerialCommands();
+  processBleCommands();
+  serviceBleTx();
+
+  if (!ble_client_connected && ble_client_connected_prev) {
+    delay(500);
+    ble_server->startAdvertising();
+    Serial.println("BLE advertising restarted");
+    ble_client_connected_prev = false;
+  } else if (ble_client_connected && !ble_client_connected_prev) {
+    ble_client_connected_prev = true;
+  }
 
   size_t bytes_read = 0;
   esp_err_t err = i2s_read(I2S_PORT, mic_slots, sizeof(mic_slots), &bytes_read, portMAX_DELAY);
   if (err != ESP_OK || bytes_read == 0) {
-    if (debug_enabled) Serial.println("i2s_read failed");
+    if (debug_enabled) Console.println("i2s_read failed");
     return;
   }
 
@@ -607,11 +834,11 @@ void loop() {
       if (cal_mode == CalMode::ROOM) {
         cal_room_db = avg_db;
         has_cal_room = true;
-        Serial.printf("Calibration complete: ROOM avg=%.2f dBSPL\n", cal_room_db);
+        Console.printf("Calibration complete: ROOM avg=%.2f dBSPL\n", cal_room_db);
       } else {
         cal_active_db = avg_db;
         has_cal_active = true;
-        Serial.printf("Calibration complete: ACTIVE avg=%.2f dBSPL\n", cal_active_db);
+        Console.printf("Calibration complete: ACTIVE avg=%.2f dBSPL\n", cal_active_db);
       }
       cal_mode = CalMode::NONE;
       cal_sum_db = 0.0;
@@ -623,9 +850,9 @@ void loop() {
         threshold_db_spl = cal_room_db + (0.50f * delta);
         hysteresis_db = clampf(0.20f * delta, 2.0f, 8.0f);
         applyConfigBounds();
-        Serial.printf("Applied suggestion: threshold=%.2f hysteresis=%.2f (delta=%.2f)\n",
-                      threshold_db_spl, hysteresis_db, delta);
-        Serial.println("Use 'save' to persist these values.");
+        Console.printf("Applied suggestion: threshold=%.2f hysteresis=%.2f (delta=%.2f)\n",
+                       threshold_db_spl, hysteresis_db, delta);
+        Console.println("Use 'save' to persist these values.");
       }
     }
   }
@@ -642,41 +869,41 @@ void loop() {
 
   if (debug_enabled && now - last_print_ms >= TELEMETRY_INTERVAL_MS) {
     last_print_ms = now;
-    Serial.print("UNPACK=");
-    Serial.print(use_lj ? "LJ" : "RJ");
-    Serial.print(" lsbNZ=");
-    Serial.print(unpack_detect.low_byte_nonzero);
-    Serial.print("/");
-    Serial.print(unpack_detect.nonzero_slots);
-    Serial.print(" dBSPL(inst)=");
-    Serial.print(spl_inst, 1);
-    Serial.print(" dBSPL(fast)=");
-    Serial.print(spl_fast, 1);
-    Serial.print(" dBSPL(ambient)=");
-    Serial.print(spl_ambient, 1);
-    Serial.print(" dBSPL(playEst)=");
+    Console.print("UNPACK=");
+    Console.print(use_lj ? "LJ" : "RJ");
+    Console.print(" lsbNZ=");
+    Console.print(unpack_detect.low_byte_nonzero);
+    Console.print("/");
+    Console.print(unpack_detect.nonzero_slots);
+    Console.print(" dBSPL(inst)=");
+    Console.print(spl_inst, 1);
+    Console.print(" dBSPL(fast)=");
+    Console.print(spl_fast, 1);
+    Console.print(" dBSPL(ambient)=");
+    Console.print(spl_ambient, 1);
+    Console.print(" dBSPL(playEst)=");
     if (has_play_est) {
-      Serial.print(spl_play_est, 1);
+      Console.print(spl_play_est, 1);
     } else {
-      Serial.print("N/A");
+      Console.print("N/A");
     }
-    Serial.print(" gain=");
-    Serial.print(base_playback_gain, 3);
-    Serial.print(" trimDb=");
-    Serial.print(gain_trim_db, 2);
-    Serial.print(" eff=");
-    Serial.print(playback_gain_effective, 3);
-    Serial.print(" env=");
-    Serial.print(playback_envelope, 3);
-    Serial.print(" ageMs=");
-    Serial.print(state_age_ms);
+    Console.print(" gain=");
+    Console.print(base_playback_gain, 3);
+    Console.print(" trimDb=");
+    Console.print(gain_trim_db, 2);
+    Console.print(" eff=");
+    Console.print(playback_gain_effective, 3);
+    Console.print(" env=");
+    Console.print(playback_envelope, 3);
+    Console.print(" ageMs=");
+    Console.print(state_age_ms);
     if (in_calibration) {
-      Serial.print(" cal=");
-      Serial.print(cal_mode == CalMode::ROOM ? "ROOM" : "ACTIVE");
-      Serial.print(" remMs=");
-      Serial.print((cal_end_ms > now) ? (cal_end_ms - now) : 0);
+      Console.print(" cal=");
+      Console.print(cal_mode == CalMode::ROOM ? "ROOM" : "ACTIVE");
+      Console.print(" remMs=");
+      Console.print((cal_end_ms > now) ? (cal_end_ms - now) : 0);
     }
-    Serial.print(" state=");
-    Serial.println(playback_active ? "PLAYING" : "IDLE");
+    Console.print(" state=");
+    Console.println(playback_active ? "PLAYING" : "IDLE");
   }
 }
