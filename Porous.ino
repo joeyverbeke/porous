@@ -11,9 +11,10 @@ static const i2s_port_t I2S_PORT = I2S_NUM_0;
 static const int PIN_I2S_BCLK = 7;  // D8
 static const int PIN_I2S_WS = 8;    // D9
 static const int PIN_I2S_DIN = 3;   // D2 (mic DOUT)
-static const int PIN_I2S_DOUT = 9;  // D10 (PCM5102A DIN)
+static const int PIN_I2S_DOUT = 9;  // D10 (amp DIN)
+static const int PIN_AMP_SD = 4;    // D3 (amp shutdown/enable)
 
-// Shared I2S clock domain for mic + DAC
+// Shared I2S clock domain for mic + amp
 static const uint32_t SAMPLE_RATE = 48000;
 static const size_t MIC_FRAME_WINDOW = 1024;   // ~21.3 ms at 48 kHz
 
@@ -69,6 +70,7 @@ static float base_playback_gain = DEFAULT_BASE_GAIN;
 static float gain_trim_db = 0.0f;
 static float playback_gain_effective = DEFAULT_BASE_GAIN;
 static float playback_envelope = 0.0f;
+static bool amp_enabled = false;
 static String serial_line;
 
 // Runtime-configurable parameters
@@ -434,7 +436,7 @@ void fillPlaybackFrames(int32_t* tx_slots, size_t frame_count) {
     }
 
     tx_slots[i * 2] = s32;      // Left slot
-    tx_slots[i * 2 + 1] = s32;  // Right slot mirrors mono content for the stereo DAC path.
+    tx_slots[i * 2 + 1] = s32;  // Right slot
   }
 }
 
@@ -485,6 +487,9 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   loadConfigFromNVS();
+
+  pinMode(PIN_AMP_SD, OUTPUT);
+  digitalWrite(PIN_AMP_SD, LOW);
 
   setupI2S();
 
@@ -626,6 +631,12 @@ void loop() {
   }
 
   fillPlaybackFrames(tx_slots, frame_count);
+  bool should_enable_amp = playback_active || (playback_envelope > 0.001f);
+  if (should_enable_amp != amp_enabled) {
+    amp_enabled = should_enable_amp;
+    digitalWrite(PIN_AMP_SD, amp_enabled ? HIGH : LOW);
+  }
+
   size_t bytes_written = 0;
   i2s_write(I2S_PORT, tx_slots, frame_count * 2 * sizeof(int32_t), &bytes_written, portMAX_DELAY);
 
