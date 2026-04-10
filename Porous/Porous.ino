@@ -438,8 +438,8 @@ void printConfig() {
   }
 }
 
-void loadConfigFromNVS() {
-  if (!prefs.begin("porous", true)) return;
+bool loadConfigFromNVS() {
+  if (!prefs.begin("porous", true)) return false;
   debug_enabled = prefs.getBool("debug", DEFAULT_DEBUG_ENABLED);
   target_mask_db = prefs.getFloat("targetMask", DEFAULT_TARGET_MASK_DB);
   threshold_db_spl = prefs.getFloat("thr", DEFAULT_THRESHOLD_DB_SPL);
@@ -457,25 +457,28 @@ void loadConfigFromNVS() {
   prefs.end();
   gain_trim_db = 0.0f;
   applyConfigBounds();
+  return true;
 }
 
-void saveConfigToNVS() {
-  if (!prefs.begin("porous", false)) return;
-  prefs.putBool("debug", debug_enabled);
-  prefs.putFloat("targetMask", target_mask_db);
-  prefs.putFloat("thr", threshold_db_spl);
-  prefs.putFloat("hyst", hysteresis_db);
-  prefs.putFloat("fastMs", rolling_avg_ms_fast);
-  prefs.putFloat("slowMs", rolling_avg_ms_slow);
-  prefs.putFloat("gain", base_playback_gain);
-  prefs.putFloat("gainMin", playback_gain_min);
-  prefs.putFloat("gainMax", playback_gain_max);
-  prefs.putFloat("gainStep", gain_step_db_per_sec);
-  prefs.putFloat("gainTrimLim", gain_trim_db_limit);
-  prefs.putBool("autoGain", auto_gain_enabled);
-  prefs.putULong("minOn", min_on_ms);
-  prefs.putULong("minOff", min_off_ms);
+bool saveConfigToNVS() {
+  if (!prefs.begin("porous", false)) return false;
+  bool ok = true;
+  ok = ok && (prefs.putBool("debug", debug_enabled) > 0);
+  ok = ok && (prefs.putFloat("targetMask", target_mask_db) > 0);
+  ok = ok && (prefs.putFloat("thr", threshold_db_spl) > 0);
+  ok = ok && (prefs.putFloat("hyst", hysteresis_db) > 0);
+  ok = ok && (prefs.putFloat("fastMs", rolling_avg_ms_fast) > 0);
+  ok = ok && (prefs.putFloat("slowMs", rolling_avg_ms_slow) > 0);
+  ok = ok && (prefs.putFloat("gain", base_playback_gain) > 0);
+  ok = ok && (prefs.putFloat("gainMin", playback_gain_min) > 0);
+  ok = ok && (prefs.putFloat("gainMax", playback_gain_max) > 0);
+  ok = ok && (prefs.putFloat("gainStep", gain_step_db_per_sec) > 0);
+  ok = ok && (prefs.putFloat("gainTrimLim", gain_trim_db_limit) > 0);
+  ok = ok && (prefs.putBool("autoGain", auto_gain_enabled) > 0);
+  ok = ok && (prefs.putULong("minOn", min_on_ms) > 0);
+  ok = ok && (prefs.putULong("minOff", min_off_ms) > 0);
   prefs.end();
+  return ok;
 }
 
 bool setConfigField(const String& key, const String& value) {
@@ -532,6 +535,7 @@ void handleCommand(const String& cmd_raw) {
     Console.println("cal_room 20");
     Console.println("cal_active 20");
     Console.println("Note: gain is linear (0.30), not +dB.");
+    Console.println("Set commands persist immediately.");
     return;
   }
   if (cmd == "show") {
@@ -539,14 +543,20 @@ void handleCommand(const String& cmd_raw) {
     return;
   }
   if (cmd == "save") {
-    saveConfigToNVS();
-    Console.println("Saved config to NVS");
+    if (saveConfigToNVS()) {
+      Console.println("Saved config to NVS");
+    } else {
+      Console.println("Failed to save config to NVS");
+    }
     return;
   }
   if (cmd == "load") {
-    loadConfigFromNVS();
-    Console.println("Loaded config from NVS");
-    printConfig();
+    if (loadConfigFromNVS()) {
+      Console.println("Loaded config from NVS");
+      printConfig();
+    } else {
+      Console.println("Failed to load config from NVS");
+    }
     return;
   }
 
@@ -595,6 +605,11 @@ void handleCommand(const String& cmd_raw) {
     Console.print(key);
     Console.print(" = ");
     Console.println(value);
+    if (saveConfigToNVS()) {
+      Console.println("Persisted config to NVS");
+    } else {
+      Console.println("Failed to persist config to NVS");
+    }
     return;
   }
 
@@ -852,7 +867,11 @@ void loop() {
         applyConfigBounds();
         Console.printf("Applied suggestion: threshold=%.2f hysteresis=%.2f (delta=%.2f)\n",
                        threshold_db_spl, hysteresis_db, delta);
-        Console.println("Use 'save' to persist these values.");
+        if (saveConfigToNVS()) {
+          Console.println("Persisted calibration suggestion to NVS.");
+        } else {
+          Console.println("Failed to persist calibration suggestion to NVS.");
+        }
       }
     }
   }
