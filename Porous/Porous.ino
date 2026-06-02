@@ -40,6 +40,7 @@ static const float DEFAULT_PLAYBACK_GAIN_MAX = 1.00f;
 static const float DEFAULT_GAIN_STEP_DB_PER_SEC = 2.0f;
 static const float DEFAULT_GAIN_TRIM_DB_LIMIT = 6.0f;
 static const bool DEFAULT_AUTO_GAIN_ENABLED = true;
+static const bool DEFAULT_SPEAKER_DEBUG_TEST = false;
 static const uint32_t DEFAULT_MIN_ON_MS = 3000;
 static const uint32_t DEFAULT_MIN_OFF_MS = 3000;
 static const bool DEFAULT_DEBUG_ENABLED = true;
@@ -150,6 +151,7 @@ static float playback_gain_max = DEFAULT_PLAYBACK_GAIN_MAX;
 static float gain_step_db_per_sec = DEFAULT_GAIN_STEP_DB_PER_SEC;
 static float gain_trim_db_limit = DEFAULT_GAIN_TRIM_DB_LIMIT;
 static bool auto_gain_enabled = DEFAULT_AUTO_GAIN_ENABLED;
+static bool speaker_debug_test = DEFAULT_SPEAKER_DEBUG_TEST;
 static uint32_t min_on_ms = DEFAULT_MIN_ON_MS;
 static uint32_t min_off_ms = DEFAULT_MIN_OFF_MS;
 static bool debug_enabled = DEFAULT_DEBUG_ENABLED;
@@ -186,6 +188,22 @@ static inline int32_t unpackRightJustified24(int32_t raw32) {
   uint32_t v = static_cast<uint32_t>(raw32) & 0x00FFFFFF;
   if (v & 0x00800000) v |= 0xFF000000;
   return static_cast<int32_t>(v);
+}
+
+bool parseBoolArg(const String& value, bool* out) {
+  if (out == nullptr) return false;
+  String normalized = value;
+  normalized.trim();
+  normalized.toLowerCase();
+  if (normalized == "1" || normalized == "on" || normalized == "true") {
+    *out = true;
+    return true;
+  }
+  if (normalized == "0" || normalized == "off" || normalized == "false") {
+    *out = false;
+    return true;
+  }
+  return false;
 }
 
 bool bleQueueByte(char c) {
@@ -423,6 +441,7 @@ void printConfig() {
   Console.printf("  rolling_avg_ms_slow=%.1f\n", rolling_avg_ms_slow);
   Console.printf("  gain=%.4f\n", base_playback_gain);
   Console.printf("  auto_gain=%d\n", auto_gain_enabled ? 1 : 0);
+  Console.printf("  speaker_debug_test=%s\n", speaker_debug_test ? "on" : "off");
   Console.printf("  gain_trim_db=%.2f\n", gain_trim_db);
   Console.printf("  gain_effective=%.4f\n", playback_gain_effective);
   Console.printf("  gain_min=%.4f\n", playback_gain_min);
@@ -452,6 +471,7 @@ bool loadConfigFromNVS() {
   gain_step_db_per_sec = prefs.getFloat("gainStep", DEFAULT_GAIN_STEP_DB_PER_SEC);
   gain_trim_db_limit = prefs.getFloat("gainTrimLim", DEFAULT_GAIN_TRIM_DB_LIMIT);
   auto_gain_enabled = prefs.getBool("autoGain", DEFAULT_AUTO_GAIN_ENABLED);
+  speaker_debug_test = prefs.getBool("spkDbgTest", DEFAULT_SPEAKER_DEBUG_TEST);
   min_on_ms = prefs.getULong("minOn", DEFAULT_MIN_ON_MS);
   min_off_ms = prefs.getULong("minOff", DEFAULT_MIN_OFF_MS);
   prefs.end();
@@ -475,6 +495,7 @@ bool saveConfigToNVS() {
   ok = ok && (prefs.putFloat("gainStep", gain_step_db_per_sec) > 0);
   ok = ok && (prefs.putFloat("gainTrimLim", gain_trim_db_limit) > 0);
   ok = ok && (prefs.putBool("autoGain", auto_gain_enabled) > 0);
+  ok = ok && (prefs.putBool("spkDbgTest", speaker_debug_test) > 0);
   ok = ok && (prefs.putULong("minOn", min_on_ms) > 0);
   ok = ok && (prefs.putULong("minOff", min_off_ms) > 0);
   prefs.end();
@@ -483,6 +504,7 @@ bool saveConfigToNVS() {
 
 bool setConfigField(const String& key, const String& value) {
   float f = value.toFloat();
+  bool b = false;
   if (key == "target_mask_db") target_mask_db = f;
   else if (key == "threshold_db_spl") threshold_db_spl = f;
   else if (key == "hysteresis_db") hysteresis_db = f;
@@ -493,8 +515,13 @@ bool setConfigField(const String& key, const String& value) {
     gain_trim_db = 0.0f;
   }
   else if (key == "auto_gain") {
-    auto_gain_enabled = (value.toInt() != 0);
+    if (!parseBoolArg(value, &b)) return false;
+    auto_gain_enabled = b;
     if (!auto_gain_enabled) gain_trim_db = 0.0f;
+  }
+  else if (key == "speaker_debug_test") {
+    if (!parseBoolArg(value, &b)) return false;
+    speaker_debug_test = b;
   }
   else if (key == "gain_min") playback_gain_min = f;
   else if (key == "gain_max") playback_gain_max = f;
@@ -502,7 +529,10 @@ bool setConfigField(const String& key, const String& value) {
   else if (key == "gain_trim_db_limit") gain_trim_db_limit = f;
   else if (key == "min_on_ms") min_on_ms = static_cast<uint32_t>(value.toInt());
   else if (key == "min_off_ms") min_off_ms = static_cast<uint32_t>(value.toInt());
-  else if (key == "debug") debug_enabled = (value.toInt() != 0);
+  else if (key == "debug") {
+    if (!parseBoolArg(value, &b)) return false;
+    debug_enabled = b;
+  }
   else return false;
   applyConfigBounds();
   return true;
@@ -519,7 +549,8 @@ void handleCommand(const String& cmd_raw) {
     Console.println("save");
     Console.println("load");
     Console.println("set gain 0.30");
-    Console.println("set auto_gain 1");
+    Console.println("set auto_gain on");
+    Console.println("set speaker_debug_test on");
     Console.println("set target_mask_db -8");
     Console.println("set threshold_db_spl 58");
     Console.println("set hysteresis_db 3");
@@ -804,6 +835,8 @@ void loop() {
   bool prev_state = playback_active;
   if (in_calibration) {
     playback_active = false;
+  } else if (speaker_debug_test) {
+    playback_active = true;
   } else {
     if (!playback_active && state_age_ms >= min_off_ms && spl_fast >= threshold_db_spl) {
       playback_active = true;
